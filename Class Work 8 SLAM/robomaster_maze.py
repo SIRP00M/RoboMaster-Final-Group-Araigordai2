@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RoboMaster EP / EP Core - 4x5 Maze Explorer v12 (FAST Frontier-Trémaux SLAM Exploration)
+RoboMaster EP / EP Core - 4x5 Maze Explorer v13 (Canonical Heading-Lock Frontier-Trémaux SLAM Exploration)
 ============================================
 
 Hardware / assumptions
@@ -256,6 +256,14 @@ CENTER_GIMBAL_TELEMETRY_STALE_S = 0.6
 # After scan, chassis must be restored this accurately before driving.
 RESTORE_YAW_TOL_DEG = 1.0
 RESTORE_YAW_HARD_FAIL_DEG = 2.0
+
+# v13: canonical chassis-heading lock.  Each logical maze heading is tied to
+# the IMU yaw measured once at mission start, so small scan/turn errors cannot
+# accumulate and silently become the new "straight ahead" direction.
+HEADING_LOCK_TOL_DEG = 0.35
+HEADING_LOCK_HARD_FAIL_DEG = 1.50
+HEADING_LOCK_FINE_MAX_DPS = 18.0
+HEADING_LOCK_TIMEOUT_S = 4.0
 
 # Trémaux may traverse each reachable passage up to twice, so keep a generous budget.
 MAX_ACTIONS = 120
@@ -791,6 +799,58 @@ def rotate_to_yaw(
     return angle_diff(target_yaw_deg, snapshot().yaw)
 
 
+def ensure_chassis_yaw(
+    chassis,
+    target_yaw_deg: float,
+    *,
+    label: str,
+    tol_deg: float = HEADING_LOCK_TOL_DEG,
+    hard_fail_deg: float = HEADING_LOCK_HARD_FAIL_DEG,
+    max_dps: float = HEADING_LOCK_FINE_MAX_DPS,
+    timeout_s: float = HEADING_LOCK_TIMEOUT_S,
+) -> float:
+    """Check chassis yaw and actively restore it to a fixed reference.
+
+    v13 uses this before/after every scan and immediately before a cell drive.
+    This prevents a small residual scan reaction from becoming the next move's
+    new yaw reference.  Returns final signed target-current residual.
+    """
+    target_yaw_deg = wrap_angle(float(target_yaw_deg))
+    safe_stop_chassis(chassis)
+    time.sleep(0.05)
+
+    before = snapshot().yaw
+    before_err = angle_diff(target_yaw_deg, before)
+    print(
+        f"[{label}] target={target_yaw_deg:+.2f} yaw={before:+.2f} "
+        f"error={before_err:+.2f} deg"
+    )
+
+    if abs(before_err) > tol_deg:
+        rotate_to_yaw(
+            chassis,
+            target_yaw_deg,
+            timeout_s=timeout_s,
+            max_dps=max_dps,
+            tol_deg=tol_deg,
+        )
+        time.sleep(0.06)
+
+    after = snapshot().yaw
+    residual = angle_diff(target_yaw_deg, after)
+    print(
+        f"[{label} DONE] yaw={after:+.2f} residual={residual:+.2f} deg "
+        f"tol={tol_deg:.2f}"
+    )
+
+    if abs(residual) > hard_fail_deg:
+        raise RuntimeError(
+            f"{label} heading restore failed: target={target_yaw_deg:+.2f} "
+            f"actual={after:+.2f} residual={residual:+.2f} deg"
+        )
+    return residual
+
+
 def calibrate_yaw_sign(chassis) -> None:
     """Tiny +z pulse to determine RoboMaster command-vs-IMU yaw sign."""
     global YAW_CMD_SIGN
@@ -934,6 +994,8 @@ def scan_360(
     gimbal,
     logger: Logger,
     cell: Tuple[int, int],
+    *,
+    chassis_yaw_ref: Optional[float] = None,
 ) -> List[ScanSample]:
     """
     Smoothly sweep -180 -> +180 while ACTIVELY holding chassis yaw.
@@ -952,8 +1014,25 @@ def scan_360(
     safe_stop_gimbal(gimbal)
     time.sleep(0.10)
 
-    yaw_ref = snapshot().yaw
-    print(f"[SCAN] reference chassis yaw={yaw_ref:+.2f} deg")
+    yaw_before_check = snapshot().yaw
+    yaw_ref = (
+        yaw_before_check
+        if chassis_yaw_ref is None
+        else wrap_angle(float(chassis_yaw_ref))
+    )
+
+    # v13 PRE-SCAN CHECK: restore the base to the canonical maze heading before
+    # the turret starts moving.  Never let the current residual become a new ref.
+    ensure_chassis_yaw(
+        chassis,
+        yaw_ref,
+        label="SCAN PRECHECK",
+        tol_deg=HEADING_LOCK_TOL_DEG,
+    )
+    print(
+        f"[SCAN] canonical reference yaw={yaw_ref:+.2f} deg "
+        f"(before_check={yaw_before_check:+.2f})"
+    )
 
     # Move turret to scan start.
     gimbal_moveto(
@@ -969,9 +1048,9 @@ def scan_360(
         yaw_ref,
         timeout_s=4.0,
         max_dps=28.0,
-        tol_deg=RESTORE_YAW_TOL_DEG,
+        tol_deg=HEADING_LOCK_TOL_DEG,
     )
-    if abs(residual) > RESTORE_YAW_HARD_FAIL_DEG:
+    if abs(residual) > HEADING_LOCK_HARD_FAIL_DEG:
         raise RuntimeError(
             f"[SCAN] pre-scan yaw restore failed: {residual:+.2f} deg"
         )
@@ -1148,13 +1227,16 @@ def scan_360(
         f"(ref={yaw_ref:+.2f})"
     )
 
-    # Fine correction before DFS is allowed to choose/drive.
-    residual = rotate_to_yaw(
+    # v13 POST-SCAN CHECK: compensate all remaining turret reaction before the
+    # planner is allowed to turn or drive.  The target is the same canonical yaw
+    # that existed before scanning, not the latest measured yaw.
+    residual = ensure_chassis_yaw(
         chassis,
         yaw_ref,
-        timeout_s=5.0,
+        label="SCAN POSTCHECK",
+        tol_deg=HEADING_LOCK_TOL_DEG,
         max_dps=20.0,
-        tol_deg=RESTORE_YAW_TOL_DEG,
+        timeout_s=5.0,
     )
 
     yaw_after_restore = snapshot().yaw
@@ -1170,7 +1252,7 @@ def scan_360(
         f"gimbal={snapshot().gimbal_yaw:+.2f}"
     )
 
-    if abs(residual) > RESTORE_YAW_HARD_FAIL_DEG:
+    if abs(residual) > HEADING_LOCK_HARD_FAIL_DEG:
         raise RuntimeError(
             f"[SCAN] final yaw restore failed: residual={residual:+.2f} deg"
         )
@@ -1386,7 +1468,13 @@ def _rollback_to_cell_start(
     return True, "ROLLBACK_OK", forward_progress
 
 
-def drive_one_cell(chassis, gimbal, *, trusted_retrace: bool = False) -> Tuple[bool, str, float]:
+def drive_one_cell(
+    chassis,
+    gimbal,
+    *,
+    trusted_retrace: bool = False,
+    target_yaw_deg: Optional[float] = None,
+) -> Tuple[bool, str, float]:
     """Drive one 0.60-m cell and always keep physical/logical cell synchronized.
 
     Safety is based on predicted clearance AT THE DESTINATION instead of a fixed
@@ -1398,13 +1486,33 @@ def drive_one_cell(chassis, gimbal, *, trusted_retrace: bool = False) -> Tuple[b
     projected-clearance (which is noisy near walls) but retains a hard ToF stop,
     low speed, IMU heading hold and odometry distance verification.
     """
-    # Make sure the ToF is pointing forward.
-    st_center = snapshot()
+    # v13: lock to the canonical maze-axis yaw BEFORE and AFTER centering the
+    # gimbal. Centering the turret can nudge the chassis, so the second check is
+    # intentional.  Do not define straight-ahead from a nudged current yaw.
+    intended_yaw = (
+        snapshot().yaw
+        if target_yaw_deg is None
+        else wrap_angle(float(target_yaw_deg))
+    )
+    ensure_chassis_yaw(
+        chassis,
+        intended_yaw,
+        label="DRIVE PRECHECK",
+        tol_deg=HEADING_LOCK_TOL_DEG,
+    )
+
     center_gimbal_closed_loop(
         gimbal,
         chassis=chassis,
-        chassis_yaw_ref=st_center.yaw,
+        chassis_yaw_ref=intended_yaw,
         timeout_s=5.0,
+    )
+
+    ensure_chassis_yaw(
+        chassis,
+        intended_yaw,
+        label="DRIVE AFTER-GIMBAL CHECK",
+        tol_deg=HEADING_LOCK_TOL_DEG,
     )
 
     pre = tof_median(samples=6)
@@ -1423,7 +1531,7 @@ def drive_one_cell(chassis, gimbal, *, trusted_retrace: bool = False) -> Tuple[b
 
     s0 = snapshot()
     x0, y0 = s0.x, s0.y
-    yaw_ref = s0.yaw
+    yaw_ref = intended_yaw
     theta = math.radians(yaw_ref)
     c = math.cos(theta)
     sn = math.sin(theta)
@@ -1611,21 +1719,15 @@ def drive_one_cell(chassis, gimbal, *, trusted_retrace: bool = False) -> Tuple[b
 
     final = snapshot()
     residual = angle_diff(yaw_ref, final.yaw)
-    if abs(residual) > RESTORE_YAW_TOL_DEG:
-        rotate_residual = rotate_to_yaw(
+    if abs(residual) > HEADING_LOCK_TOL_DEG:
+        residual = ensure_chassis_yaw(
             chassis,
             yaw_ref,
-            timeout_s=3.0,
+            label="DRIVE POSTCHECK",
+            tol_deg=HEADING_LOCK_TOL_DEG,
             max_dps=15.0,
-            tol_deg=RESTORE_YAW_TOL_DEG,
+            timeout_s=3.0,
         )
-        if abs(rotate_residual) > RESTORE_YAW_HARD_FAIL_DEG:
-            # We have physically entered the next cell. Stop rather than claim
-            # a successful centered pose with a bad heading.
-            raise RuntimeError(
-                f"[POSE SAFETY] reached next cell but post-move yaw restore "
-                f"failed: {rotate_residual:+.2f}deg"
-            )
 
     print(
         f"[MOVE OK] progress={progress:.3f}m lateral={lateral:+.3f}m "
@@ -1657,6 +1759,9 @@ class MazeExplorer:
         self.output_dir = output_dir
         self.current = (START_ROW, START_COL)
         self.heading = START_HEADING % 4
+        # v13: IMU yaw corresponding to START_HEADING, captured once in run().
+        # All four maze axes are derived from this immutable reference.
+        self.heading_zero_yaw: Optional[float] = None
         self.visited = {self.current}
         self.edges: Dict[Tuple[int, int, int], str] = {}
 
@@ -2005,33 +2110,45 @@ class MazeExplorer:
 
         return None
 
+    def canonical_yaw_for_heading(self, heading: int) -> float:
+        """Return the fixed IMU yaw for logical heading 0/1/2/3."""
+        if self.heading_zero_yaw is None:
+            raise RuntimeError("Canonical maze yaw has not been initialized")
+
+        rel_steps = (int(heading) - START_HEADING) % 4
+        if rel_steps == 3:
+            rel_steps = -1
+        elif rel_steps == 2:
+            rel_steps = 2
+
+        return wrap_angle(
+            self.heading_zero_yaw + YAW_CMD_SIGN * 90.0 * rel_steps
+        )
+
     def turn_to_heading(self, chassis, target_heading: int) -> None:
         target_heading %= 4
-        delta_steps = (target_heading - self.heading) % 4
-        if delta_steps == 3:
-            delta_steps = -1
-        elif delta_steps == 2:
-            delta_steps = 2
-
-        if delta_steps == 0:
-            return
-
+        target_imu = self.canonical_yaw_for_heading(target_heading)
         before = snapshot().yaw
-        cmd_deg = 90.0 * delta_steps
-        target_imu = wrap_angle(before + cmd_deg * YAW_CMD_SIGN)
+        err_before = angle_diff(target_imu, before)
+
         print(
-            f"[TURN] heading {self.heading}->{target_heading} "
-            f"command-equivalent={cmd_deg:+.0f} deg IMU target={target_imu:+.2f}"
+            f"[TURN/CANONICAL] heading {self.heading}->{target_heading} "
+            f"target={target_imu:+.2f} current={before:+.2f} "
+            f"error={err_before:+.2f}"
         )
 
-        residual = rotate_to_yaw(
+        # Even when logical heading does not change, verify the physical chassis
+        # still lies on the canonical axis before the next cell drive.
+        residual = ensure_chassis_yaw(
             chassis,
             target_imu,
-            timeout_s=7.0,
+            label=f"TURN H{target_heading}",
+            tol_deg=HEADING_LOCK_TOL_DEG,
+            hard_fail_deg=HEADING_LOCK_HARD_FAIL_DEG,
             max_dps=TURN_MAX_DPS,
-            tol_deg=TURN_TOL_DEG,
+            timeout_s=7.0,
         )
-        if abs(residual) > RESTORE_YAW_HARD_FAIL_DEG:
+        if abs(residual) > HEADING_LOCK_HARD_FAIL_DEG:
             raise RuntimeError(f"Turn failed, residual={residual:+.2f} deg")
 
         self.heading = target_heading
@@ -2125,9 +2242,21 @@ class MazeExplorer:
             json.dump(payload, f, indent=2, ensure_ascii=False)
 
     def run(self, chassis, gimbal, logger: Logger) -> None:
+        # Capture the maze-axis zero ONCE. From now on every scan, turn and drive
+        # returns to one of four yaws derived from this value.
+        if self.heading_zero_yaw is None:
+            safe_stop_chassis(chassis)
+            time.sleep(0.10)
+            self.heading_zero_yaw = snapshot().yaw
+
         print(
             f"[MAZE/FRONTIER] {MAZE_COLS}x{MAZE_ROWS}, cell={CELL_SIZE_M:.2f}m, "
             f"start={self.current}, heading={self.heading}"
+        )
+        print(
+            f"[HEADING LOCK] start_heading={START_HEADING} "
+            f"yaw_zero={self.heading_zero_yaw:+.2f} deg | "
+            f"tol=±{HEADING_LOCK_TOL_DEG:.2f} deg"
         )
         print(
             "[EXPLORE] policy = scan 360 -> update map -> local frontier -> "
@@ -2150,7 +2279,14 @@ class MazeExplorer:
             time.sleep(0.10)
             print("[EXPLORE] STOP -> 360 SCAN -> MAP UPDATE -> REPLAN")
 
-            scan = scan_360(chassis, gimbal, logger, self.current)
+            expected_scan_yaw = self.canonical_yaw_for_heading(self.heading)
+            scan = scan_360(
+                chassis,
+                gimbal,
+                logger,
+                self.current,
+                chassis_yaw_ref=expected_scan_yaw,
+            )
             self.update_from_scan(scan)
 
             if len(self.visited) >= MAZE_ROWS * MAZE_COLS:
@@ -2210,10 +2346,12 @@ class MazeExplorer:
 
             self.turn_to_heading(chassis, target_heading)
 
+            drive_yaw_ref = self.canonical_yaw_for_heading(self.heading)
             ok, reason, travelled = drive_one_cell(
                 chassis,
                 gimbal,
                 trusted_retrace=trusted_retrace,
+                target_yaw_deg=drive_yaw_ref,
             )
             if ok:
                 self.clear_edge_failures(old_cell, target_heading)
@@ -2362,7 +2500,7 @@ def main() -> None:
             f"gimbal={s.gimbal_yaw:+.2f}"
         )
         print(f"[OUTPUT] {output_dir}")
-        print("[SAFETY] v12 Persistent-Frontier SLAM + map memory + near-target cell snap + rollback watchdog enabled; keep Ctrl+C ready")
+        print("[SAFETY] v13 canonical heading lock + pre/post scan compensation + Persistent-Frontier SLAM + rollback watchdog enabled; keep Ctrl+C ready")
 
         explorer = MazeExplorer(output_dir)
         explorer.run(chassis, gimbal, logger)
